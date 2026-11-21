@@ -1,6 +1,6 @@
 # projectmem - proyek-analgor-kelompok-6-P2
 
-_Last updated: 2026-11-18_
+_Last updated: 2026-11-21_
 
 ## Project purpose
 A local browser app for testing N-Queens solvers written in C++. A solver is a plain function: it gets the problem as arguments and returns every solution, like any N-Queens exercise. Solvers are compiled to WebAssembly and run in a Web Worker. The app times the function over several runs and…
@@ -9,7 +9,7 @@ A local browser app for testing N-Queens solvers written in C++. A solver is a p
 - [DONE] #legacy_e9c4 Legacy issue: fix(ui): the Debug run switch is a switch again -> fix(ui): the Debug run switch is a switch again (fixed)
 
 ## Decisions
-- No decisions logged yet.
+- Placed the four per-case C++ solvers under Solver/algorithms/ named by algorithm: d4-symmetry-bitmask.cpp, preplaced-bitmask-mrv.cpp, holes-bitmask-algx.cpp, and walled-bbmcx-clique.cpp [Solver/algorithms/]
 
 ## Notes
 - Initial release: the N-Queen tester with four example solvers
@@ -17,6 +17,8 @@ A local browser app for testing N-Queens solvers written in C++. A solver is a p
 - feat: H and W replace K, and a wall in the Walled grid is 'W' instead of 'P'
 - docs(readme): drop the note about the earlier 'P' for a wall
 - New feature: feat(solvers): add six N-Queens algorithms under Solver/algorithms [Solver/algorithms/backtracking-bitmask.cpp]
+- New feature: feat(solvers): add symmetry, DLX and max-clique solvers [Solver/algorithms/backtracking-symmetry.cpp]
+- gotcha: returning a struct member vector (e.g. return search.solutions) in C++17 disables NRVO and deep-copies all solution vectors, doubling WASM sbrk heap peak; return a local vector or std::move it instead [Solver/]
 
 ## Key files
 - `.gitignore`

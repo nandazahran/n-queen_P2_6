@@ -133,7 +133,9 @@ inline void emitD4Orbit(uint64_t packed, uint8_t mask, int n, bool debug,
 struct D4Holes {
   int n = 0, m = 0;
   uint32_t full = 0;
+  uint32_t edgeBits = 0;
   uint32_t rowMask[12]{};
+  uint16_t colBits[12]{};
   uint8_t killMask[12][12]{};  // 144 B: bit k set iff T_k(r, c) is a hole in grid
 
   static constexpr int kStackCap = 2048;  // 16 KB on stack; max fundamentals at N=12 is 1,787
@@ -141,141 +143,159 @@ struct D4Holes {
   int stackCount = 0;
   size_t totalSolutions = 0;
 
-  inline void addFundamental(uint64_t packed, uint32_t emitMask) {
+  inline void addFundamental(const uint8_t* cols, uint32_t emitMask) {
     if (!emitMask) return;
-    stackBuf[stackCount++] = packed | (static_cast<uint64_t>(emitMask) << 48);
+    uint64_t packed = static_cast<uint64_t>(emitMask) << 48;
+    for (int r = 0; r < n; ++r) packed |= static_cast<uint64_t>(cols[r]) << (r << 2);
+    stackBuf[stackCount++] = packed;
     totalSolutions += static_cast<size_t>(popcnt32(emitMask));
   }
 
-  void onCornerLeaf(int c1, uint64_t packed, uint32_t alive) {
-    if (static_cast<int>((packed >> (c1 << 2)) & 0xFu) != 1) {
-      addFundamental(packed, alive);
-      return;
-    }
+  template <bool Corner, bool HasHoles>
+  void onLeaf(int keyCol, uint32_t b2, uint32_t bLast) {
+    colBits[n - 2] = static_cast<uint16_t>(b2);
+    colBits[n - 1] = static_cast<uint16_t>(bLast);
     uint8_t cols[12];
-    uint8_t inv[12];
+    uint32_t alive = 0xFFu;
     for (int r = 0; r < n; ++r) {
-      const uint8_t c = static_cast<uint8_t>((packed >> (r << 2)) & 0xFu);
+      const uint8_t c = static_cast<uint8_t>(ctzBit(colBits[r]));
       cols[r] = c;
-      inv[c] = static_cast<uint8_t>(r);
-    }
-    const int cmp = cmpBoard(cols, inv, n);
-    if (cmp > 0) return;
-    addFundamental(packed, cmp == 0 ? (alive & 0x69u) : alive);
-  }
-
-  void onInteriorLeaf(int c0, uint64_t packed, uint32_t alive) {
-    const int colM = static_cast<int>((packed >> (m << 2)) & 0xFu);
-    const int colC0 = static_cast<int>((packed >> (c0 << 2)) & 0xFu);
-    const int colMC0 = static_cast<int>((packed >> ((m - c0) << 2)) & 0xFu);
-    const bool tied = (colM == c0 || colM == m - c0 ||
-                       colC0 == 0 || colC0 == m ||
-                       colMC0 == 0 || colMC0 == m);
-    if (!tied) {
-      addFundamental(packed, alive);
-      return;
-    }
-    uint8_t imgs[8][12];
-    for (int r = 0; r < n; ++r) imgs[0][r] = static_cast<uint8_t>((packed >> (r << 2)) & 0xFu);
-    for (int k = 1; k < 8; ++k) {
-      applyD4(k, imgs[0], imgs[k], n);
-      if (cmpBoard(imgs[k], imgs[0], n) < 0) return;
-    }
-    uint32_t canonMask = 1u;
-    for (int k = 1; k < 8; ++k) {
-      bool dup = false;
-      for (int j = 0; j < k; ++j) {
-        if (((canonMask >> j) & 1u) && cmpBoard(imgs[k], imgs[j], n) == 0) {
-          dup = true;
-          break;
-        }
+      if constexpr (HasHoles) {
+        alive &= ~static_cast<uint32_t>(killMask[r][c]);
+        if (!alive) return;
       }
-      if (!dup) canonMask |= (1u << k);
     }
-    addFundamental(packed, alive & canonMask);
+    if constexpr (Corner) {
+      if (cols[keyCol] != 1) {
+        addFundamental(cols, alive);
+        return;
+      }
+      uint8_t inv[12];
+      for (int r = 0; r < n; ++r) inv[cols[r]] = static_cast<uint8_t>(r);
+      const int cmp = cmpBoard(cols, inv, n);
+      if (cmp > 0) return;
+      addFundamental(cols, cmp == 0 ? (alive & 0x69u) : alive);
+    } else {
+      const int c0 = keyCol;
+      const bool tied = (cols[m] == c0 || cols[m] == m - c0 ||
+                         cols[c0] == 0 || cols[c0] == m ||
+                         cols[m - c0] == 0 || cols[m - c0] == m);
+      if (!tied) {
+        addFundamental(cols, alive);
+        return;
+      }
+      uint8_t imgs[8][12];
+      for (int r = 0; r < n; ++r) imgs[0][r] = cols[r];
+      for (int k = 1; k < 8; ++k) {
+        applyD4(k, imgs[0], imgs[k], n);
+        if (cmpBoard(imgs[k], imgs[0], n) < 0) return;
+      }
+      uint32_t canonMask = 1u;
+      for (int k = 1; k < 8; ++k) {
+        bool dup = false;
+        for (int j = 0; j < k; ++j) {
+          if (((canonMask >> j) & 1u) && cmpBoard(imgs[k], imgs[j], n) == 0) {
+            dup = true;
+            break;
+          }
+        }
+        if (!dup) canonMask |= (1u << k);
+      }
+      addFundamental(cols, alive & canonMask);
+    }
   }
 
   template <bool Corner, bool HasHoles>
-  void dfs(int row, uint32_t col, uint32_t d1, uint32_t d2, int keyCol, uint64_t packed, uint32_t alive) {
+  void dfs(int row, uint32_t col, uint32_t d1, uint32_t d2, int keyCol) {
     uint32_t avail = rowMask[row] & ~(col | d1 | d2);
-    if (row == n - 2) {
-      const uint32_t lastMask = rowMask[n - 1];
-      const uint8_t* km2 = killMask[n - 2];
-      const uint8_t* km1 = killMask[n - 1];
-      while (avail) {
-        const uint32_t b = avail & (~avail + 1u);
-        avail ^= b;
-        const int c2 = ctzBit(b);
-        uint32_t a2 = alive;
-        if constexpr (HasHoles) {
-          a2 &= ~static_cast<uint32_t>(km2[c2]);
-          if (!a2) continue;
+    if (row == n - 3) {
+      if constexpr (!Corner) {
+        if (keyCol == 1) {
+          if ((col & edgeBits) == 0u) avail &= edgeBits;
+        } else if (keyCol == 2) {
+          const uint32_t need = edgeBits & ~col;
+          if (need == edgeBits) return;
+          if (need) avail &= need;
         }
-        const uint32_t col2 = col | b;
-        const uint32_t last = lastMask & ~(col2 | ((d1 | b) << 1) | ((d2 | b) >> 1));
-        if (last) {
-          const int cLast = ctzBit(last);
-          uint32_t leafAlive = a2;
-          if constexpr (HasHoles) {
-            leafAlive &= ~static_cast<uint32_t>(km1[cLast]);
-            if (!leafAlive) continue;
+      }
+      const uint32_t mask2 = rowMask[n - 2];
+      const uint32_t mask1 = rowMask[n - 1];
+      while (avail) {
+        const uint32_t b3 = avail & (~avail + 1u);
+        avail ^= b3;
+        const uint32_t col1 = col | b3;
+        const uint32_t d1_1 = (d1 | b3) << 1;
+        const uint32_t d2_1 = (d2 | b3) >> 1;
+        uint32_t avail2 = mask2 & ~(col1 | d1_1 | d2_1);
+        if constexpr (!Corner) {
+          if (keyCol == 1) {
+            const uint32_t need2 = edgeBits & ~col1;
+            if (need2 == edgeBits) continue;
+            if (need2) avail2 &= need2;
           }
-          const uint64_t leafPacked = packed |
-                                      (static_cast<uint64_t>(c2) << ((n - 2) << 2)) |
-                                      (static_cast<uint64_t>(cLast) << ((n - 1) << 2));
-          if constexpr (Corner) onCornerLeaf(keyCol, leafPacked, leafAlive);
-          else onInteriorLeaf(keyCol, leafPacked, leafAlive);
+        }
+        if (!avail2) continue;
+        colBits[n - 3] = static_cast<uint16_t>(b3);
+        while (avail2) {
+          const uint32_t b2 = avail2 & (~avail2 + 1u);
+          avail2 ^= b2;
+          const uint32_t last = mask1 & ~((col1 | b2) | ((d1_1 | b2) << 1) | ((d2_1 | b2) >> 1));
+          if (last) onLeaf<Corner, HasHoles>(keyCol, b2, last);
         }
       }
       return;
     }
-    const uint8_t* km = killMask[row];
-    const int shift = row << 2;
+    if (row == n - 2) {
+      const uint32_t lastMask = rowMask[n - 1];
+      while (avail) {
+        const uint32_t b = avail & (~avail + 1u);
+        avail ^= b;
+        const uint32_t last = lastMask & ~((col | b) | ((d1 | b) << 1) | ((d2 | b) >> 1));
+        if (last) onLeaf<Corner, HasHoles>(keyCol, b, last);
+      }
+      return;
+    }
+    if constexpr (!Corner) {
+      const int edgeEnd = n - keyCol;
+      if (row == edgeEnd - 2) {
+        if ((col & edgeBits) == 0u) avail &= edgeBits;
+      } else if (row == edgeEnd - 1) {
+        const uint32_t need = edgeBits & ~col;
+        if (need == edgeBits) return;
+        if (need) avail &= need;
+      }
+    }
     while (avail) {
       const uint32_t b = avail & (~avail + 1u);
       avail ^= b;
-      const int c = ctzBit(b);
-      uint32_t nextAlive = alive;
-      if constexpr (HasHoles) {
-        nextAlive &= ~static_cast<uint32_t>(km[c]);
-        if (!nextAlive) continue;
-      }
-      dfs<Corner, HasHoles>(row + 1, col | b, (d1 | b) << 1, (d2 | b) >> 1, keyCol,
-                            packed | (static_cast<uint64_t>(c) << shift), nextAlive);
+      colBits[row] = static_cast<uint16_t>(b);
+      dfs<Corner, HasHoles>(row + 1, col | b, (d1 | b) << 1, (d2 | b) >> 1, keyCol);
     }
   }
 
   template <bool HasHoles>
   void runAll() {
-    // Family 1: Corner queen at (0, 0).
-    uint32_t a0 = 0xFFu;
-    if constexpr (HasHoles) a0 &= ~static_cast<uint32_t>(killMask[0][0]);
-    if (a0) {
+    edgeBits = 1u | (1u << m);
+    if (!HasHoles || killMask[0][0] != 0xFFu) {
+      colBits[0] = 1u;
       for (int c1 = 2; c1 < n; ++c1) {
-        uint32_t a1 = a0;
-        if constexpr (HasHoles) {
-          a1 &= ~static_cast<uint32_t>(killMask[1][c1]);
-          if (!a1) continue;
-        }
+        if (HasHoles && ((killMask[0][0] | killMask[1][c1]) == 0xFFu)) continue;
+        const uint32_t b1 = 1u << c1;
+        colBits[1] = static_cast<uint16_t>(b1);
         for (int r = 2; r < n; ++r) rowMask[r] = (r < c1) ? (full & ~2u) : full;
-        const uint32_t b0 = 1u, b1 = 1u << c1;
-        dfs<true, HasHoles>(2, b0 | b1, ((b0 << 1) | b1) << 1, ((b0 >> 1) | b1) >> 1, c1,
-                            static_cast<uint64_t>(c1) << 4, a1);
+        const uint32_t b0 = 1u;
+        dfs<true, HasHoles>(2, b0 | b1, ((b0 << 1) | b1) << 1, ((b0 >> 1) | b1) >> 1, c1);
       }
     }
 
-    // Family 2: No corner queen; minimum border distance c0 at (0, c0).
-    const uint32_t noSides = full & ~(1u | (1u << m));
+    const uint32_t noSides = full & ~edgeBits;
     for (int c0 = 1; c0 <= (n - 2) / 2; ++c0) {
-      uint32_t ac0 = 0xFFu;
-      if constexpr (HasHoles) {
-        ac0 &= ~static_cast<uint32_t>(killMask[0][c0]);
-        if (!ac0) continue;
-      }
+      if (HasHoles && killMask[0][c0] == 0xFFu) continue;
+      const uint32_t b0 = 1u << c0;
+      colBits[0] = static_cast<uint16_t>(b0);
       for (int r = 1; r < n - 1; ++r) rowMask[r] = (r < c0 || r >= n - c0) ? noSides : full;
       rowMask[n - 1] = ((1u << (n - 2 * c0)) - 1u) << c0;
-      const uint32_t b0 = 1u << c0;
-      dfs<false, HasHoles>(1, b0, b0 << 1, b0 >> 1, c0, static_cast<uint64_t>(c0), ac0);
+      dfs<false, HasHoles>(1, b0, b0 << 1, b0 >> 1, c0);
     }
   }
 };
@@ -605,7 +625,7 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
   if (holeCount == 0 && n <= 12) return solveD4Holes(n, grid, 0);
   if (minLineFree < (n + 1) / 2 && !hasPerfectMatching(n, rowAllowed)) return {};
 
-  if (n <= 12 && minLineFree >= 3 && holeCount * 6 <= n * n) {
+  if (n <= 12 && minLineFree >= 3 && holeCount * 8 <= n * n) {
     return solveD4Holes(n, grid, holeCount);
   }
 

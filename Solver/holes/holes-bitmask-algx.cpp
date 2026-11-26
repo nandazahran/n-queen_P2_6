@@ -1,7 +1,5 @@
-// Solver for the Holes case (4C): 64-bit SWAR Bidirectional Bitmask Algorithm X (N <= 12)
-// with pre-table root unit propagation, reduced-board Hall check, SWAR root SAC-1 pruning
-// for dense/medium/UNSAT boards, fast shift-based active-cell attack table construction,
-// branchless rowSent placement, early rem==2 geometric exit, and N<=8 2-word specialization.
+// Solver for the Holes case (5C): 5A SWAR-AlgX synthesis + branchless 1-multiply uniqueCols
+// row lookup + split-half (0x0F/0xF0) direct emitD4Orbit + dense-only root SAC-1 (H >= N^2/2).
 #if __cplusplus >= 202002L
 #include <bit>
 #endif
@@ -19,6 +17,7 @@ constexpr uint64_t k7FFF = 0x7FFF7FFF7FFF7FFFULL;
 constexpr uint64_t kHigh = 0x8000800080008000ULL;
 constexpr uint64_t kData = 0x0FFF0FFF0FFF0FFFULL;
 constexpr uint64_t kSentWord = 0x7000700070007000ULL;
+constexpr uint64_t kColPack = 0x0001000200040008ULL;
 
 inline int popcnt32(uint32_t x) {
 #if __cplusplus >= 202002L
@@ -50,7 +49,7 @@ inline int ctzBit32(uint32_t b) {
 #if __cplusplus >= 202002L
   return std::countr_zero(b);
 #else
-  return popcnt32(b - 1u);
+  return popcnt32((b & (~b + 1u)) - 1u);
 #endif
 }
 
@@ -64,15 +63,14 @@ inline int ctz64(uint64_t x) {
 
 inline void applyD4(int k, const uint8_t* src, uint8_t* dst, int n) {
   const int m = n - 1;
-  switch (k) {
-    case 0: for (int r = 0; r < n; ++r) dst[r] = src[r]; break;
-    case 1: for (int r = 0; r < n; ++r) dst[r] = static_cast<uint8_t>(m - src[r]); break;
-    case 2: for (int r = 0; r < n; ++r) dst[m - r] = src[r]; break;
-    case 3: for (int r = 0; r < n; ++r) dst[m - r] = static_cast<uint8_t>(m - src[r]); break;
-    case 4: for (int r = 0; r < n; ++r) dst[src[r]] = static_cast<uint8_t>(r); break;
-    case 5: for (int r = 0; r < n; ++r) dst[src[r]] = static_cast<uint8_t>(m - r); break;
-    case 6: for (int r = 0; r < n; ++r) dst[m - src[r]] = static_cast<uint8_t>(r); break;
-    default: for (int r = 0; r < n; ++r) dst[m - src[r]] = static_cast<uint8_t>(m - r); break;
+  if (k < 4) {
+    for (int r = 0; r < n; ++r) {
+      dst[(k & 2) ? (m - r) : r] = static_cast<uint8_t>((k & 1) ? (m - src[r]) : src[r]);
+    }
+  } else {
+    for (int r = 0; r < n; ++r) {
+      dst[(k & 2) ? (m - src[r]) : src[r]] = static_cast<uint8_t>((k & 1) ? (m - r) : r);
+    }
   }
 }
 
@@ -130,28 +128,64 @@ inline void emitD4Orbit(uint64_t packed, uint8_t mask, int n, bool debug,
     return;
   }
 
-  int src[kMaxN];
-  int buf[kMaxN];
-  for (int r = 0; r < n; ++r) src[r] = static_cast<int>((packed >> (r << 2)) & 0xFu);
-  uint32_t km = mask;
-  while (km) {
-    const uint32_t kb = km & (~km + 1u);
-    km ^= kb;
-    const int k = ctzBit32(kb);
-    switch (k) {
-      case 0: for (int r = 0; r < n; ++r) buf[r] = src[r]; break;
-      case 1: for (int r = 0; r < n; ++r) buf[r] = m - src[r]; break;
-      case 2: for (int r = 0; r < n; ++r) buf[m - r] = src[r]; break;
-      case 3: for (int r = 0; r < n; ++r) buf[m - r] = m - src[r]; break;
-      case 4: for (int r = 0; r < n; ++r) buf[src[r]] = r; break;
-      case 5: for (int r = 0; r < n; ++r) buf[src[r]] = m - r; break;
-      case 6: for (int r = 0; r < n; ++r) buf[m - src[r]] = r; break;
-      default: for (int r = 0; r < n; ++r) buf[m - src[r]] = m - r; break;
+  if ((mask & (mask - 1u)) == 0) {
+    int buf[kMaxN];
+    const int k = ctzBit32(mask);
+    if (k < 4) {
+      for (int r = 0; r < n; ++r) {
+        const int c = static_cast<int>((packed >> (r << 2)) & 0xFu);
+        buf[(k & 2) ? (m - r) : r] = (k & 1) ? (m - c) : c;
+      }
+    } else {
+      for (int r = 0; r < n; ++r) {
+        const int c = static_cast<int>((packed >> (r << 2)) & 0xFu);
+        buf[(k & 2) ? (m - c) : c] = (k & 1) ? (m - r) : r;
+      }
     }
     solutions.emplace_back(buf, buf + n);
     if (debug) {
       snapshot(nq::queensOf(solutions.back()), "solution " + std::to_string(solutions.size()));
     }
+    return;
+  }
+
+  auto pushBuf = [&](const int* buf) {
+    solutions.emplace_back(buf, buf + n);
+    if (debug) {
+      snapshot(nq::queensOf(solutions.back()), "solution " + std::to_string(solutions.size()));
+    }
+  };
+  if (mask & 0x0Fu) {
+    int b0[kMaxN], b1[kMaxN], b2[kMaxN], b3[kMaxN];
+    for (int r = 0; r < n; ++r) {
+      const int c = static_cast<int>((packed >> (r << 2)) & 0xFu);
+      const int mc = m - c;
+      const int mr = m - r;
+      b0[r] = c;
+      b1[r] = mc;
+      b2[mr] = c;
+      b3[mr] = mc;
+    }
+    if (mask & 0x01u) pushBuf(b0);
+    if (mask & 0x02u) pushBuf(b1);
+    if (mask & 0x04u) pushBuf(b2);
+    if (mask & 0x08u) pushBuf(b3);
+  }
+  if (mask & 0xF0u) {
+    int b4[kMaxN], b5[kMaxN], b6[kMaxN], b7[kMaxN];
+    for (int r = 0; r < n; ++r) {
+      const int c = static_cast<int>((packed >> (r << 2)) & 0xFu);
+      const int mc = m - c;
+      const int mr = m - r;
+      b4[c] = r;
+      b5[c] = mr;
+      b6[mc] = r;
+      b7[mc] = mr;
+    }
+    if (mask & 0x10u) pushBuf(b4);
+    if (mask & 0x20u) pushBuf(b5);
+    if (mask & 0x40u) pushBuf(b6);
+    if (mask & 0x80u) pushBuf(b7);
   }
 }
 
@@ -339,29 +373,9 @@ struct SwarHolesAlgX {
 
   template <bool TwoWords>
   inline uint32_t colRowsMask(int c, uint64_t d0, uint64_t d1, uint64_t d2) const {
-    const uint64_t cm = (1ULL << c) * kOnes;
-    uint32_t res = 0;
-    if (const uint64_t w0 = d0 & cm) {
-      if (w0 & 0x000000000000FFFFULL) res |= 1u << 0;
-      if (w0 & 0x00000000FFFF0000ULL) res |= 1u << 1;
-      if (w0 & 0x0000FFFF00000000ULL) res |= 1u << 2;
-      if (w0 & 0xFFFF000000000000ULL) res |= 1u << 3;
-    }
-    if (const uint64_t w1 = d1 & cm) {
-      if (w1 & 0x000000000000FFFFULL) res |= 1u << 4;
-      if (w1 & 0x00000000FFFF0000ULL) res |= 1u << 5;
-      if (w1 & 0x0000FFFF00000000ULL) res |= 1u << 6;
-      if (w1 & 0xFFFF000000000000ULL) res |= 1u << 7;
-    }
-    if constexpr (!TwoWords) {
-      if (const uint64_t w2 = d2 & cm) {
-        if (w2 & 0x000000000000FFFFULL) res |= 1u << 8;
-        if (w2 & 0x00000000FFFF0000ULL) res |= 1u << 9;
-        if (w2 & 0x0000FFFF00000000ULL) res |= 1u << 10;
-        if (w2 & 0xFFFF000000000000ULL) res |= 1u << 11;
-      }
-    }
-    return res;
+    uint64_t v = ((d0 >> c) & kOnes) | (((d1 >> c) & kOnes) << 4);
+    if constexpr (!TwoWords) v |= (((d2 >> c) & kOnes) << 8);
+    return static_cast<uint32_t>((v * kColPack) >> 48);
   }
 
   template <bool TwoWords>
@@ -453,12 +467,7 @@ struct SwarHolesAlgX {
 
       const uint32_t cb = uniqueCols & (~uniqueCols + 1u);
       const int c = ctzBit32(cb);
-      const uint64_t cm = static_cast<uint64_t>(cb) * kOnes;
-      int r;
-      if (const uint64_t w = d1 & cm) r = 4 + (ctz64(w) >> 4);
-      else if constexpr (TwoWords) r = ctz64(d0 & cm) >> 4;
-      else if (const uint64_t w = d0 & cm) r = ctz64(w) >> 4;
-      else r = 8 + (ctz64(d2 & cm) >> 4);
+      const int r = ctzBit32(colRowsMask<TwoWords>(c, d0, d1, d2));
       --rem;
       rowMask |= (1u << r);
       colMask |= cb;
@@ -588,19 +597,13 @@ struct SwarHolesAlgX {
   template <int Mode, bool TwoWords>
   void dfs(int rem, uint32_t rowMask, uint32_t colMask, uint64_t d0, uint64_t d1, uint64_t d2,
            uint64_t packed) {
+    // Invariant: dfs is always entered with rem >= 2.
     for (;;) {
       // 1. Zero-loop SWAR dead-row check.
       if constexpr (TwoWords) {
         if ((~(d0 + k7FFF) | ~(d1 + k7FFF)) & kHigh) return;
       } else {
         if ((~(d0 + k7FFF) | ~(d1 + k7FFF) | ~(d2 + k7FFF)) & kHigh) return;
-      }
-
-      if (rem == 1) {
-        const int r0 = ctzBit32(full ^ rowMask);
-        const int c0 = ctzBit32(full ^ colMask);
-        onLeaf<Mode>(packed | (static_cast<uint64_t>(c0) << (r0 << 2)));
-        return;
       }
 
       // 2. Zero-loop SWAR forced-row check.
@@ -632,6 +635,17 @@ struct SwarHolesAlgX {
         colMask |= cb;
         place<TwoWords>(r, c, d0, d1, d2);
         packed |= static_cast<uint64_t>(c) << (r << 2);
+        if (rem == 1) {
+          if constexpr (TwoWords) {
+            if ((~(d0 + k7FFF) | ~(d1 + k7FFF)) & kHigh) return;
+          } else {
+            if ((~(d0 + k7FFF) | ~(d1 + k7FFF) | ~(d2 + k7FFF)) & kHigh) return;
+          }
+          const int r0 = ctzBit32(full ^ rowMask);
+          const int c0 = ctzBit32(full ^ colMask);
+          onLeaf<Mode>(packed | (static_cast<uint64_t>(c0) << (r0 << 2)));
+          return;
+        }
         continue;
       }
 
@@ -683,12 +697,7 @@ struct SwarHolesAlgX {
       if (uniqueCols) {
         const uint32_t cb = uniqueCols & (~uniqueCols + 1u);
         const int c = ctzBit32(cb);
-        const uint64_t cm = static_cast<uint64_t>(cb) * kOnes;
-        int r;
-        if (const uint64_t w = d1 & cm) r = 4 + (ctz64(w) >> 4);
-        else if constexpr (TwoWords) r = ctz64(d0 & cm) >> 4;
-        else if (const uint64_t w = d0 & cm) r = ctz64(w) >> 4;
-        else r = 8 + (ctz64(d2 & cm) >> 4);
+        const int r = ctzBit32(colRowsMask<TwoWords>(c, d0, d1, d2));
         --rem;
         rowMask |= (1u << r);
         colMask |= cb;
@@ -965,7 +974,6 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
   uint32_t colMask = 0;
   uint64_t packed = 0;
   if (!useD4) {
-    // General Holes path: root unit propagation before building attack tables.
     if (minLineFree == 1) {
       if (!rootUnitProp(n, full, rowAllowed, rem, rowMask, colMask, packed)) return {};
       if (rem == 0) {
@@ -993,21 +1001,19 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
       }
     }
 
-    // Reduced-board Hall check (skipped when Dirac guarantees a perfect matching).
     const uint32_t freeRows = full ^ rowMask;
     if (minLineFree == 1 || minLineFree < (rem + 1) / 2) {
       if (!hasPerfectMatchingRem(n, freeRows, rowAllowed)) return {};
     }
   }
 
-  // Single SwarHolesAlgX instance (~33 KB) keeps Emscripten 64 KB stack safe.
+  // Single SwarHolesAlgX instance (~35 KB total frame) keeps Emscripten 64 KB stack safe.
   SwarHolesAlgX solver;
   solver.n = n;
   solver.m = n - 1;
   solver.full = full;
 
   if (useD4) {
-    // Hall's condition is mathematically guaranteed for minLineFree >= 3 && H <= N^2/8 (N <= 12).
     solver.buildTables(nullptr);
 
     if (holeCount == 0) {
@@ -1044,12 +1050,11 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
   }
 
   solver.buildTables(rowAllowed);
-
   uint64_t d0, d1, d2;
   solver.packRows(rowAllowed, rowMask, d0, d1, d2);
 
-  // Root SWAR SAC-1 pruning for medium/dense/UNSAT boards (H >= N^2/3).
-  if (rem >= 3 && holeCount * 3 >= n * n) {
+  // Dense-only root SAC-1 (H >= N^2/2): zero cost on sparse/medium boards.
+  if (rem >= 3 && holeCount * 2 >= n * n) {
     const bool ok = (n <= 8)
                         ? solver.sacPrune<true>(rem, rowMask, colMask, d0, d1, d2, packed)
                         : solver.sacPrune<false>(rem, rowMask, colMask, d0, d1, d2, packed);

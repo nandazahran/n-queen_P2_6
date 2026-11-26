@@ -1,10 +1,7 @@
-// Solver for the Holes case (3B): Unified 64KB-safe Turbo Bidirectional Bitmask Algorithm X.
-// Uses a single ~25 KB stack engine for BOTH:
-//   - Empty & sparse Holes (H == 0 or H <= N^2/8, N <= 12): D4 canonical border symmetry + Turbo AlgX
-//     (cuts N=12 D4 nodes from 194,792 to 55,928) with leaf-only killMask filtering and 16 KB orbit buffer.
-//   - Moderate/dense/UNSAT Holes (and N > 12): Turbo Bitmask AlgX (bitmask freeRows, bit-parallel
-//     once/twice/thrice column counters, iterative unit propagation, geometric rem==2 square prune,
-//     Knuth Organ-Pipe center-first tie-breaking) + zero-aux-heap two-pass spill.
+// Solver for the Holes case (4C): 64-bit SWAR Bidirectional Bitmask Algorithm X (N <= 12)
+// with pre-table root unit propagation, reduced-board Hall check, SWAR root SAC-1 pruning
+// for dense/medium/UNSAT boards, fast shift-based active-cell attack table construction,
+// branchless rowSent placement, early rem==2 geometric exit, and N<=8 2-word specialization.
 #if __cplusplus >= 202002L
 #include <bit>
 #endif
@@ -16,7 +13,12 @@
 
 namespace {
 
-constexpr int kMaxN = 16;
+constexpr int kMaxN = 12;
+constexpr uint64_t kOnes = 0x0001000100010001ULL;
+constexpr uint64_t k7FFF = 0x7FFF7FFF7FFF7FFFULL;
+constexpr uint64_t kHigh = 0x8000800080008000ULL;
+constexpr uint64_t kData = 0x0FFF0FFF0FFF0FFFULL;
+constexpr uint64_t kSentWord = 0x7000700070007000ULL;
 
 inline int popcnt32(uint32_t x) {
 #if __cplusplus >= 202002L
@@ -31,11 +33,32 @@ inline int popcnt32(uint32_t x) {
 #endif
 }
 
-inline int ctzBit(uint32_t b) {
+inline int popcnt64(uint64_t x) {
+#if __cplusplus >= 202002L
+  return std::popcount(x);
+#else
+  int c = 0;
+  while (x) {
+    x &= x - 1ULL;
+    ++c;
+  }
+  return c;
+#endif
+}
+
+inline int ctzBit32(uint32_t b) {
 #if __cplusplus >= 202002L
   return std::countr_zero(b);
 #else
   return popcnt32(b - 1u);
+#endif
+}
+
+inline int ctz64(uint64_t x) {
+#if __cplusplus >= 202002L
+  return std::countr_zero(x);
+#else
+  return popcnt64((x & (~x + 1ULL)) - 1ULL);
 #endif
 }
 
@@ -114,7 +137,7 @@ inline void emitD4Orbit(uint64_t packed, uint8_t mask, int n, bool debug,
   while (km) {
     const uint32_t kb = km & (~km + 1u);
     km ^= kb;
-    const int k = ctzBit(kb);
+    const int k = ctzBit32(kb);
     switch (k) {
       case 0: for (int r = 0; r < n; ++r) buf[r] = src[r]; break;
       case 1: for (int r = 0; r < n; ++r) buf[r] = m - src[r]; break;
@@ -132,7 +155,7 @@ inline void emitD4Orbit(uint64_t packed, uint8_t mask, int n, bool debug,
   }
 }
 
-bool hasPerfectMatching(int n, const uint32_t* rowAllowed) {
+bool hasPerfectMatchingRem(int n, uint32_t freeRows, const uint32_t* rowAllowed) {
   int colOwner[kMaxN];
   for (int c = 0; c < n; ++c) colOwner[c] = -1;
 
@@ -141,7 +164,7 @@ bool hasPerfectMatching(int n, const uint32_t* rowAllowed) {
     while (cand) {
       const uint32_t b = cand & (~cand + 1u);
       cand ^= b;
-      const int c = ctzBit(b);
+      const int c = ctzBit32(b);
       visited |= b;
       if (colOwner[c] < 0 || self(self, colOwner[c], visited)) {
         colOwner[c] = r;
@@ -151,12 +174,90 @@ bool hasPerfectMatching(int n, const uint32_t* rowAllowed) {
     return false;
   };
 
-  for (int r = 0; r < n; ++r) {
+  uint32_t fr = freeRows;
+  while (fr) {
+    const uint32_t rb = fr & (~fr + 1u);
+    fr ^= rb;
+    const int r = ctzBit32(rb);
     uint32_t visited = 0;
     if (!augment(augment, r, visited)) return false;
   }
   return true;
 }
+
+bool rootUnitProp(int n, uint32_t full, uint32_t* rowAllowed, int& rem,
+                  uint32_t& rowMask, uint32_t& colMask, uint64_t& packed) {
+  auto placeRoot = [&](int r, int c) -> bool {
+    const uint32_t rb = 1u << r;
+    const uint32_t cb = 1u << c;
+    rowMask |= rb;
+    colMask |= cb;
+    --rem;
+    packed |= static_cast<uint64_t>(c) << (r << 2);
+    rowAllowed[r] = 0;
+    uint32_t fr = full ^ rowMask;
+    while (fr) {
+      const uint32_t r2b = fr & (~fr + 1u);
+      fr ^= r2b;
+      const int r2 = ctzBit32(r2b);
+      uint32_t kill = cb;
+      const int dr = r2 > r ? (r2 - r) : (r - r2);
+      if (c >= dr) kill |= 1u << (c - dr);
+      if (c + dr < n) kill |= 1u << (c + dr);
+      rowAllowed[r2] &= ~kill;
+      if (rowAllowed[r2] == 0) return false;
+    }
+    return true;
+  };
+
+  while (rem > 0) {
+    uint32_t once = 0;
+    uint32_t twice = 0;
+    int forcedR = -1;
+    uint32_t forcedCb = 0;
+    uint32_t fr = full ^ rowMask;
+    while (fr) {
+      const uint32_t rb = fr & (~fr + 1u);
+      fr ^= rb;
+      const int r = ctzBit32(rb);
+      const uint32_t av = rowAllowed[r];
+      if (av == 0) return false;
+      if ((av & (av - 1u)) == 0) {
+        forcedR = r;
+        forcedCb = av;
+        break;
+      }
+      twice |= once & av;
+      once |= av;
+    }
+    if (forcedR >= 0) {
+      if (!placeRoot(forcedR, ctzBit32(forcedCb))) return false;
+      continue;
+    }
+    if ((once | colMask) != full) return false;
+    const uint32_t uniqueCols = once & ~twice;
+    if (!uniqueCols) break;
+    const uint32_t cb = uniqueCols & (~uniqueCols + 1u);
+    const int c = ctzBit32(cb);
+    int r = -1;
+    uint32_t fr2 = full ^ rowMask;
+    while (fr2) {
+      const uint32_t rb = fr2 & (~fr2 + 1u);
+      fr2 ^= rb;
+      const int cand = ctzBit32(rb);
+      if (rowAllowed[cand] & cb) {
+        r = cand;
+        break;
+      }
+    }
+    if (r < 0 || !placeRoot(r, c)) return false;
+  }
+  return true;
+}
+
+struct CellAtk {
+  uint64_t m0, m1, m2;
+};
 
 enum LeafMode {
   kGeneralBuf = 0,
@@ -167,22 +268,244 @@ enum LeafMode {
   kD4IntHoles = 5,
 };
 
-struct UnifiedHolesAlgX {
+struct SwarHolesAlgX {
   int n = 0;
   int m = 0;
   int keyCol = 0;
   uint32_t full = 0;
-  uint32_t rowAllowed[kMaxN]{};
-  uint32_t colAllowed[kMaxN]{};
+  uint32_t centralCols = 0;
   uint8_t centerDist[kMaxN]{};
-  uint8_t killMask[12][12]{};
+  uint8_t killMask[kMaxN][kMaxN]{};
+  uint64_t rowSent[kMaxN][3]{};
+  CellAtk atk[kMaxN][kMaxN];
 
-  static constexpr size_t kStackCap = 3072;  // 24 KB on stack (shared across D4 & general modes)
+  static constexpr size_t kStackCap = 3584;  // 28 KB on stack (~35 KB total frame)
   uint64_t stackBuf[kStackCap];
   size_t orbitCount = 0;
   size_t totalSolutions = 0;
   std::vector<std::vector<int>>* out = nullptr;
   bool debug = false;
+
+  void buildTables(const uint32_t* activeRows) {
+    centralCols = 0;
+    for (int i = 0; i < n; ++i) {
+      const int d = 2 * i - m;
+      const int ad = d < 0 ? -d : d;
+      centerDist[i] = static_cast<uint8_t>(ad);
+      if (ad <= 3) centralCols |= (1u << i);
+      rowSent[i][0] = (i < 4) ? (0x7000ULL << ((i & 3) << 4)) : 0ULL;
+      rowSent[i][1] = (i >= 4 && i < 8) ? (0x7000ULL << ((i & 3) << 4)) : 0ULL;
+      rowSent[i][2] = (i >= 8) ? (0x7000ULL << ((i & 3) << 4)) : 0ULL;
+    }
+    for (int r = 0; r < n; ++r) {
+      uint32_t cols = activeRows ? activeRows[r] : full;
+      const int rWord = r >> 2;
+      const uint64_t rClear = ~(0xFFFFULL << ((r & 3) << 4));
+      while (cols) {
+        const uint32_t cb = cols & (~cols + 1u);
+        cols ^= cb;
+        const int c = ctzBit32(cb);
+        const uint64_t colKeep = ~(static_cast<uint64_t>(cb) * kOnes);
+        uint64_t w[3] = {colKeep, colKeep, colKeep};
+        w[rWord] &= rClear;
+        for (int r2 = r - 1, cl = c - 1, cr = c + 1; r2 >= 0; --r2, --cl, ++cr) {
+          const uint32_t diag = (cl >= 0 ? (1u << cl) : 0u) | (cr < n ? (1u << cr) : 0u);
+          if (!diag) break;
+          w[r2 >> 2] &= ~(static_cast<uint64_t>(diag) << ((r2 & 3) << 4));
+        }
+        for (int r2 = r + 1, cl = c - 1, cr = c + 1; r2 < n; ++r2, --cl, ++cr) {
+          const uint32_t diag = (cl >= 0 ? (1u << cl) : 0u) | (cr < n ? (1u << cr) : 0u);
+          if (!diag) break;
+          w[r2 >> 2] &= ~(static_cast<uint64_t>(diag) << ((r2 & 3) << 4));
+        }
+        atk[r][c] = {w[0], w[1], w[2]};
+      }
+    }
+  }
+
+  template <bool TwoWords>
+  inline void place(int r, int c, uint64_t& d0, uint64_t& d1, uint64_t& d2) const {
+    const CellAtk& a = atk[r][c];
+    d0 = (d0 & a.m0) | rowSent[r][0];
+    d1 = (d1 & a.m1) | rowSent[r][1];
+    if constexpr (!TwoWords) d2 = (d2 & a.m2) | rowSent[r][2];
+  }
+
+  template <bool TwoWords>
+  inline uint32_t getLane(int r, uint64_t d0, uint64_t d1, uint64_t d2) const {
+    const uint64_t w = (r < 4) ? d0 : (TwoWords || r < 8 ? d1 : d2);
+    return static_cast<uint32_t>((w >> ((r & 3) << 4)) & 0xFFFu);
+  }
+
+  template <bool TwoWords>
+  inline uint32_t colRowsMask(int c, uint64_t d0, uint64_t d1, uint64_t d2) const {
+    const uint64_t cm = (1ULL << c) * kOnes;
+    uint32_t res = 0;
+    if (const uint64_t w0 = d0 & cm) {
+      if (w0 & 0x000000000000FFFFULL) res |= 1u << 0;
+      if (w0 & 0x00000000FFFF0000ULL) res |= 1u << 1;
+      if (w0 & 0x0000FFFF00000000ULL) res |= 1u << 2;
+      if (w0 & 0xFFFF000000000000ULL) res |= 1u << 3;
+    }
+    if (const uint64_t w1 = d1 & cm) {
+      if (w1 & 0x000000000000FFFFULL) res |= 1u << 4;
+      if (w1 & 0x00000000FFFF0000ULL) res |= 1u << 5;
+      if (w1 & 0x0000FFFF00000000ULL) res |= 1u << 6;
+      if (w1 & 0xFFFF000000000000ULL) res |= 1u << 7;
+    }
+    if constexpr (!TwoWords) {
+      if (const uint64_t w2 = d2 & cm) {
+        if (w2 & 0x000000000000FFFFULL) res |= 1u << 8;
+        if (w2 & 0x00000000FFFF0000ULL) res |= 1u << 9;
+        if (w2 & 0x0000FFFF00000000ULL) res |= 1u << 10;
+        if (w2 & 0xFFFF000000000000ULL) res |= 1u << 11;
+      }
+    }
+    return res;
+  }
+
+  template <bool TwoWords>
+  bool propagateSwar(int& rem, uint32_t& rowMask, uint32_t& colMask,
+                     uint64_t& d0, uint64_t& d1, uint64_t& d2, uint64_t& packed) const {
+    for (;;) {
+      if constexpr (TwoWords) {
+        if ((~(d0 + k7FFF) | ~(d1 + k7FFF)) & kHigh) return false;
+      } else {
+        if ((~(d0 + k7FFF) | ~(d1 + k7FFF) | ~(d2 + k7FFF)) & kHigh) return false;
+      }
+      if (rem == 0) return true;
+      if (rem == 1) {
+        const int r0 = ctzBit32(full ^ rowMask);
+        const int c0 = ctzBit32(full ^ colMask);
+        rowMask |= (1u << r0);
+        colMask |= (1u << c0);
+        --rem;
+        packed |= static_cast<uint64_t>(c0) << (r0 << 2);
+        place<TwoWords>(r0, c0, d0, d1, d2);
+        return true;
+      }
+
+      const uint64_t y0 = d0 & (d0 - kOnes);
+      const uint64_t y1 = d1 & (d1 - kOnes);
+      const uint64_t y2 = TwoWords ? 0ULL : (d2 & (d2 - kOnes));
+      const uint64_t o0 = ~(y0 + k7FFF) & kHigh;
+      const uint64_t o1 = ~(y1 + k7FFF) & kHigh;
+      const uint64_t o2 = TwoWords ? 0ULL : (~(y2 + k7FFF) & kHigh);
+      if (o0 | o1 | o2) {
+        int r;
+        uint32_t cb;
+        if (o1) {
+          const int l = ctz64(o1) >> 4;
+          r = 4 + l;
+          cb = static_cast<uint32_t>((d1 >> (l << 4)) & 0xFFFu);
+        } else if (o0) {
+          const int l = ctz64(o0) >> 4;
+          r = l;
+          cb = static_cast<uint32_t>((d0 >> (l << 4)) & 0xFFFu);
+        } else {
+          const int l = ctz64(o2) >> 4;
+          r = 8 + l;
+          cb = static_cast<uint32_t>((d2 >> (l << 4)) & 0xFFFu);
+        }
+        const int c = ctzBit32(cb);
+        --rem;
+        rowMask |= (1u << r);
+        colMask |= cb;
+        place<TwoWords>(r, c, d0, d1, d2);
+        packed |= static_cast<uint64_t>(c) << (r << 2);
+        continue;
+      }
+
+      if (rem == 2) {
+        const uint32_t fr = full ^ rowMask;
+        const uint32_t rb0 = fr & (~fr + 1u);
+        const int r0 = ctzBit32(rb0), r1 = ctzBit32(fr ^ rb0);
+        const uint32_t fc = full ^ colMask;
+        const uint32_t cb0 = fc & (~fc + 1u);
+        const int c0 = ctzBit32(cb0), c1 = ctzBit32(fc ^ cb0);
+        return (r1 - r0 != c1 - c0);
+      }
+
+      const uint64_t m0 = d0 & kData;
+      const uint64_t m1 = d1 & kData;
+      uint64_t once4, twice4;
+      if constexpr (TwoWords) {
+        once4 = m0 | m1;
+        twice4 = m0 & m1;
+      } else {
+        const uint64_t m2 = d2 & kData;
+        const uint64_t o01 = m0 | m1;
+        once4 = o01 | m2;
+        twice4 = (m0 & m1) | (o01 & m2);
+      }
+      const uint32_t oA = static_cast<uint32_t>(once4), oB = static_cast<uint32_t>(once4 >> 32);
+      const uint32_t tA = static_cast<uint32_t>(twice4), tB = static_cast<uint32_t>(twice4 >> 32);
+      const uint32_t once2 = oA | oB;
+      const uint32_t twice2 = tA | tB | (oA & oB);
+      const uint32_t onceLo = once2 & 0xFFFu, onceHi = once2 >> 16;
+      const uint32_t once = onceLo | onceHi;
+      if ((once | colMask) != full) return false;
+
+      const uint32_t twiceLo = twice2 & 0xFFFu, twiceHi = twice2 >> 16;
+      const uint32_t twice = twiceLo | twiceHi | (onceLo & onceHi);
+      const uint32_t uniqueCols = once & ~twice;
+      if (!uniqueCols) return true;
+
+      const uint32_t cb = uniqueCols & (~uniqueCols + 1u);
+      const int c = ctzBit32(cb);
+      const uint64_t cm = static_cast<uint64_t>(cb) * kOnes;
+      int r;
+      if (const uint64_t w = d1 & cm) r = 4 + (ctz64(w) >> 4);
+      else if constexpr (TwoWords) r = ctz64(d0 & cm) >> 4;
+      else if (const uint64_t w = d0 & cm) r = ctz64(w) >> 4;
+      else r = 8 + (ctz64(d2 & cm) >> 4);
+      --rem;
+      rowMask |= (1u << r);
+      colMask |= cb;
+      place<TwoWords>(r, c, d0, d1, d2);
+      packed |= static_cast<uint64_t>(c) << (r << 2);
+    }
+  }
+
+  template <bool TwoWords>
+  bool sacPrune(int& rem, uint32_t& rowMask, uint32_t& colMask,
+                uint64_t& d0, uint64_t& d1, uint64_t& d2, uint64_t& packed) const {
+    bool changed = true;
+    while (changed && rem >= 3) {
+      changed = false;
+      uint32_t fr = full ^ rowMask;
+      while (fr) {
+        const uint32_t rb = fr & (~fr + 1u);
+        fr ^= rb;
+        const int r = ctzBit32(rb);
+        uint32_t av = getLane<TwoWords>(r, d0, d1, d2);
+        while (av) {
+          const uint32_t cb = av & (~av + 1u);
+          av ^= cb;
+          const int c = ctzBit32(cb);
+          int tRem = rem - 1;
+          uint32_t tRowMask = rowMask | rb;
+          uint32_t tColMask = colMask | cb;
+          uint64_t td0 = d0, td1 = d1, td2 = d2;
+          uint64_t tPacked = 0;
+          place<TwoWords>(r, c, td0, td1, td2);
+          if (!propagateSwar<TwoWords>(tRem, tRowMask, tColMask, td0, td1, td2, tPacked)) {
+            const uint64_t clr = ~(static_cast<uint64_t>(cb) << ((r & 3) << 4));
+            if (r < 4) d0 &= clr;
+            else if (TwoWords || r < 8) d1 &= clr;
+            else d2 &= clr;
+            changed = true;
+            if (!propagateSwar<TwoWords>(rem, rowMask, colMask, d0, d1, d2, packed)) return false;
+            if (rem < 3) return true;
+            if (rowMask & rb) break;
+            av &= getLane<TwoWords>(r, d0, d1, d2);
+            fr &= (full ^ rowMask);
+          }
+        }
+      }
+    }
+    return true;
+  }
 
   inline void addOrbit(uint64_t packed, uint32_t emitMask) {
     if (!emitMask) return;
@@ -219,8 +542,8 @@ struct UnifiedHolesAlgX {
         addOrbit(packed, alive);
         return;
       }
-      uint8_t cols[12];
-      uint8_t inv[12];
+      uint8_t cols[kMaxN];
+      uint8_t inv[kMaxN];
       for (int r = 0; r < n; ++r) {
         const uint8_t c = static_cast<uint8_t>((packed >> (r << 2)) & 0xFu);
         cols[r] = c;
@@ -241,7 +564,7 @@ struct UnifiedHolesAlgX {
         addOrbit(packed, alive);
         return;
       }
-      uint8_t imgs[8][12];
+      uint8_t imgs[8][kMaxN];
       for (int r = 0; r < n; ++r) imgs[0][r] = static_cast<uint8_t>((packed >> (r << 2)) & 0xFu);
       for (int k = 1; k < 8; ++k) {
         applyD4(k, imgs[0], imgs[k], n);
@@ -262,235 +585,333 @@ struct UnifiedHolesAlgX {
     }
   }
 
-  inline uint32_t availRow(int r, uint32_t colMask, uint32_t diagSum, uint32_t diagDiffRow) const {
-    return rowAllowed[r] & ~(colMask | (diagSum >> r) | (diagDiffRow >> (m - r)));
-  }
-
-  inline uint32_t availCol(int c, uint32_t rowMask, uint32_t diagSum, uint32_t diagDiffCol) const {
-    return colAllowed[c] & ~(rowMask | (diagSum >> c) | (diagDiffCol >> (m - c)));
-  }
-
-  template <int Mode>
-  void dfs(int rem, uint32_t rowMask, uint32_t colMask, uint32_t diagSum,
-           uint32_t diagDiffRow, uint32_t diagDiffCol, uint64_t packed) {
+  template <int Mode, bool TwoWords>
+  void dfs(int rem, uint32_t rowMask, uint32_t colMask, uint64_t d0, uint64_t d1, uint64_t d2,
+           uint64_t packed) {
     for (;;) {
+      // 1. Zero-loop SWAR dead-row check.
+      if constexpr (TwoWords) {
+        if ((~(d0 + k7FFF) | ~(d1 + k7FFF)) & kHigh) return;
+      } else {
+        if ((~(d0 + k7FFF) | ~(d1 + k7FFF) | ~(d2 + k7FFF)) & kHigh) return;
+      }
+
       if (rem == 1) {
-        const int r0 = ctzBit(full ^ rowMask);
-        const uint32_t a0 = availRow(r0, colMask, diagSum, diagDiffRow);
-        if (a0) {
-          onLeaf<Mode>(packed | (static_cast<uint64_t>(ctzBit(a0)) << (r0 << 2)));
-        }
+        const int r0 = ctzBit32(full ^ rowMask);
+        const int c0 = ctzBit32(full ^ colMask);
+        onLeaf<Mode>(packed | (static_cast<uint64_t>(c0) << (r0 << 2)));
         return;
       }
+
+      // 2. Zero-loop SWAR forced-row check.
+      const uint64_t y0 = d0 & (d0 - kOnes);
+      const uint64_t y1 = d1 & (d1 - kOnes);
+      const uint64_t y2 = TwoWords ? 0ULL : (d2 & (d2 - kOnes));
+      const uint64_t o0 = ~(y0 + k7FFF) & kHigh;
+      const uint64_t o1 = ~(y1 + k7FFF) & kHigh;
+      const uint64_t o2 = TwoWords ? 0ULL : (~(y2 + k7FFF) & kHigh);
+      if (o0 | o1 | o2) {
+        int r;
+        uint32_t cb;
+        if (o1) {
+          const int l = ctz64(o1) >> 4;
+          r = 4 + l;
+          cb = static_cast<uint32_t>((d1 >> (l << 4)) & 0xFFFu);
+        } else if (o0) {
+          const int l = ctz64(o0) >> 4;
+          r = l;
+          cb = static_cast<uint32_t>((d0 >> (l << 4)) & 0xFFFu);
+        } else {
+          const int l = ctz64(o2) >> 4;
+          r = 8 + l;
+          cb = static_cast<uint32_t>((d2 >> (l << 4)) & 0xFFFu);
+        }
+        const int c = ctzBit32(cb);
+        --rem;
+        rowMask |= (1u << r);
+        colMask |= cb;
+        place<TwoWords>(r, c, d0, d1, d2);
+        packed |= static_cast<uint64_t>(c) << (r << 2);
+        continue;
+      }
+
+      // Early rem == 2 exit: both rows passed dead & forced checks, so both have exact freeCols {c0, c1}.
       if (rem == 2) {
         const uint32_t fr = full ^ rowMask;
         const uint32_t rb0 = fr & (~fr + 1u);
-        const int r0 = ctzBit(rb0);
-        const int r1 = ctzBit(fr ^ rb0);
+        const int r0 = ctzBit32(rb0), r1 = ctzBit32(fr ^ rb0);
         const uint32_t fc = full ^ colMask;
         const uint32_t cb0 = fc & (~fc + 1u);
-        const uint32_t cb1 = fc ^ cb0;
-        const int c0 = ctzBit(cb0);
-        const int c1 = ctzBit(cb1);
-        if (r1 - r0 == c1 - c0) return;
-        const uint32_t a0 = availRow(r0, colMask, diagSum, diagDiffRow);
-        if (!a0) return;
-        const uint32_t a1 = availRow(r1, colMask, diagSum, diagDiffRow);
-        if (!a1) return;
-        if ((a0 & cb0) && (a1 & cb1)) {
+        const int c0 = ctzBit32(cb0), c1 = ctzBit32(fc ^ cb0);
+        if (r1 - r0 != c1 - c0) {
           onLeaf<Mode>(packed | (static_cast<uint64_t>(c0) << (r0 << 2)) |
                        (static_cast<uint64_t>(c1) << (r1 << 2)));
-        }
-        if ((a0 & cb1) && (a1 & cb0)) {
           onLeaf<Mode>(packed | (static_cast<uint64_t>(c1) << (r0 << 2)) |
                        (static_cast<uint64_t>(c0) << (r1 << 2)));
         }
         return;
       }
 
-      uint32_t fr = full ^ rowMask;
-      uint32_t once = 0, twice = 0, thrice = 0;
-      int bestRow = -1;
-      int bestRowKey = 1000;
-      uint32_t bestRowAvail = 0;
-      bool forced = false;
-      int fR = 0, fC = 0;
-      uint32_t fRB = 0, fCB = 0;
-
-      while (fr) {
-        const uint32_t rb = fr & (~fr + 1u);
-        fr ^= rb;
-        const int r = ctzBit(rb);
-        const uint32_t a = availRow(r, colMask, diagSum, diagDiffRow);
-        if (!a) return;
-        if ((a & (a - 1u)) == 0u) {
-          forced = true;
-          fR = r;
-          fRB = rb;
-          fCB = a;
-          fC = ctzBit(a);
-          break;
-        }
-        const int key = (popcnt32(a) << 4) | centerDist[r];
-        if (key < bestRowKey) {
-          bestRowKey = key;
-          bestRow = r;
-          bestRowAvail = a;
-        }
-        thrice |= (twice & a);
-        twice |= (once & a);
-        once |= a;
+      // 3. Zero-loop SWAR column cardinality (once, twice, thrice).
+      const uint64_t m0 = d0 & kData;
+      const uint64_t m1 = d1 & kData;
+      uint64_t once4, twice4, thrice4;
+      if constexpr (TwoWords) {
+        once4 = m0 | m1;
+        twice4 = m0 & m1;
+        thrice4 = 0ULL;
+      } else {
+        const uint64_t m2 = d2 & kData;
+        const uint64_t o01 = m0 | m1;
+        const uint64_t t01 = m0 & m1;
+        once4 = o01 | m2;
+        twice4 = t01 | (o01 & m2);
+        thrice4 = t01 & m2;
       }
 
-      if (forced) {
-        --rem;
-        rowMask |= fRB;
-        colMask |= fCB;
-        diagSum |= (1u << (fR + fC));
-        diagDiffRow |= (1u << (fC - fR + m));
-        diagDiffCol |= (1u << (fR - fC + m));
-        packed |= (static_cast<uint64_t>(fC) << (fR << 2));
-        continue;
-      }
-
+      const uint32_t oA = static_cast<uint32_t>(once4), oB = static_cast<uint32_t>(once4 >> 32);
+      const uint32_t tA = static_cast<uint32_t>(twice4), tB = static_cast<uint32_t>(twice4 >> 32);
+      const uint32_t once2 = oA | oB;
+      const uint32_t twice2 = tA | tB | (oA & oB);
+      const uint32_t onceLo = once2 & 0xFFFu, onceHi = once2 >> 16;
+      const uint32_t once = onceLo | onceHi;
       if ((once | colMask) != full) return;
 
+      const uint32_t twiceLo = twice2 & 0xFFFu, twiceHi = twice2 >> 16;
+      const uint32_t twice = twiceLo | twiceHi | (onceLo & onceHi);
       const uint32_t uniqueCols = once & ~twice;
       if (uniqueCols) {
         const uint32_t cb = uniqueCols & (~uniqueCols + 1u);
-        const int c = ctzBit(cb);
-        const uint32_t rb = availCol(c, rowMask, diagSum, diagDiffCol);
-        const int r = ctzBit(rb);
+        const int c = ctzBit32(cb);
+        const uint64_t cm = static_cast<uint64_t>(cb) * kOnes;
+        int r;
+        if (const uint64_t w = d1 & cm) r = 4 + (ctz64(w) >> 4);
+        else if constexpr (TwoWords) r = ctz64(d0 & cm) >> 4;
+        else if (const uint64_t w = d0 & cm) r = ctz64(w) >> 4;
+        else r = 8 + (ctz64(d2 & cm) >> 4);
         --rem;
-        rowMask |= rb;
+        rowMask |= (1u << r);
         colMask |= cb;
-        diagSum |= (1u << (r + c));
-        diagDiffRow |= (1u << (c - r + m));
-        diagDiffCol |= (1u << (r - c + m));
-        packed |= (static_cast<uint64_t>(c) << (r << 2));
+        place<TwoWords>(r, c, d0, d1, d2);
+        packed |= static_cast<uint64_t>(c) << (r << 2);
         continue;
       }
 
-      const int bestRowCnt = bestRowKey >> 4;
-      int bestCol = -1;
-      uint32_t bestColAvail = 0;
+      // 4. SWAR count-2 rows + central count-2 columns Organ-Pipe priority.
+      const uint64_t z0 = y0 & (y0 - kOnes);
+      const uint64_t z1 = y1 & (y1 - kOnes);
+      const uint64_t z2 = TwoWords ? 0ULL : (y2 & (y2 - kOnes));
+      const uint64_t tw0 = ~(z0 + k7FFF) & kHigh;
+      const uint64_t tw1 = ~(z1 + k7FFF) & kHigh;
+      const uint64_t tw2 = TwoWords ? 0ULL : (~(z2 + k7FFF) & kHigh);
+
+      if (!TwoWords && tw1) {
+        int r;
+        if (tw1 & 0x0000800000000000ULL) r = 6;
+        else if (tw1 & 0x0000000080000000ULL) r = 5;
+        else if (tw1 & 0x8000000000000000ULL) r = 7;
+        else r = 4;
+        const uint32_t av = static_cast<uint32_t>((d1 >> ((r & 3) << 4)) & 0xFFFu);
+        const uint32_t cb0 = av & (~av + 1u);
+        const uint32_t cb1 = av ^ cb0;
+        const int c0 = ctzBit32(cb0), c1 = ctzBit32(cb1);
+        const uint32_t nRowMask = rowMask | (1u << r);
+        uint64_t nd0 = d0, nd1 = d1, nd2 = d2;
+        place<TwoWords>(r, c0, nd0, nd1, nd2);
+        dfs<Mode, TwoWords>(rem - 1, nRowMask, colMask | cb0, nd0, nd1, nd2,
+                            packed | (static_cast<uint64_t>(c0) << (r << 2)));
+        --rem;
+        rowMask = nRowMask;
+        colMask |= cb1;
+        place<TwoWords>(r, c1, d0, d1, d2);
+        packed |= (static_cast<uint64_t>(c1) << (r << 2));
+        continue;
+      }
+
+      const uint32_t hA = static_cast<uint32_t>(thrice4), hB = static_cast<uint32_t>(thrice4 >> 32);
+      const uint32_t thrice2 = (TwoWords ? 0u : (hA | hB)) | (tA & oB) | (oA & tB);
+      const uint32_t thrice = (thrice2 & 0xFFFu) | (thrice2 >> 16) |
+                              (twiceLo & onceHi) | (onceLo & twiceHi);
       const uint32_t c2 = twice & ~thrice;
+
+      const uint32_t c2Cent = c2 & centralCols;
+      if (c2Cent) {
+        int bestC = -1, bestD = 99;
+        uint32_t cm = c2Cent;
+        while (cm) {
+          const uint32_t cb = cm & (~cm + 1u);
+          cm ^= cb;
+          const int c = ctzBit32(cb);
+          if (centerDist[c] < bestD) { bestD = centerDist[c]; bestC = c; }
+        }
+        const uint32_t cb = 1u << bestC;
+        const uint32_t rmask = colRowsMask<TwoWords>(bestC, d0, d1, d2);
+        const uint32_t rb0 = rmask & (~rmask + 1u);
+        const uint32_t rb1 = rmask ^ rb0;
+        const int r0 = ctzBit32(rb0), r1 = ctzBit32(rb1);
+        const uint32_t nColMask = colMask | cb;
+        uint64_t nd0 = d0, nd1 = d1, nd2 = d2;
+        place<TwoWords>(r0, bestC, nd0, nd1, nd2);
+        dfs<Mode, TwoWords>(rem - 1, rowMask | rb0, nColMask, nd0, nd1, nd2,
+                            packed | (static_cast<uint64_t>(bestC) << (r0 << 2)));
+        --rem;
+        rowMask |= rb1;
+        colMask = nColMask;
+        place<TwoWords>(r1, bestC, d0, d1, d2);
+        packed |= (static_cast<uint64_t>(bestC) << (r1 << 2));
+        continue;
+      }
+
+      if (tw0 | tw1 | tw2) {
+        int r;
+        uint32_t av;
+        if (TwoWords && tw1) {
+          if (tw1 & 0x0000000000008000ULL) r = 4;
+          else if (tw1 & 0x0000000080000000ULL) r = 5;
+          else if (tw1 & 0x0000800000000000ULL) r = 6;
+          else r = 7;
+          av = static_cast<uint32_t>((d1 >> ((r & 3) << 4)) & 0xFFFu);
+        } else if (tw0) {
+          if (tw0 & 0x8000000000000000ULL) r = 3;
+          else if (tw0 & 0x0000800000000000ULL) r = 2;
+          else if (tw0 & 0x0000000080000000ULL) r = 1;
+          else r = 0;
+          av = static_cast<uint32_t>((d0 >> ((r & 3) << 4)) & 0xFFFu);
+        } else {
+          if (tw2 & 0x0000000000008000ULL) r = 8;
+          else if (tw2 & 0x0000000080000000ULL) r = 9;
+          else if (tw2 & 0x0000800000000000ULL) r = 10;
+          else r = 11;
+          av = static_cast<uint32_t>((d2 >> ((r & 3) << 4)) & 0xFFFu);
+        }
+        const uint32_t cb0 = av & (~av + 1u);
+        const uint32_t cb1 = av ^ cb0;
+        const int c0 = ctzBit32(cb0), c1 = ctzBit32(cb1);
+        const uint32_t nRowMask = rowMask | (1u << r);
+        uint64_t nd0 = d0, nd1 = d1, nd2 = d2;
+        place<TwoWords>(r, c0, nd0, nd1, nd2);
+        dfs<Mode, TwoWords>(rem - 1, nRowMask, colMask | cb0, nd0, nd1, nd2,
+                            packed | (static_cast<uint64_t>(c0) << (r << 2)));
+        --rem;
+        rowMask = nRowMask;
+        colMask |= cb1;
+        place<TwoWords>(r, c1, d0, d1, d2);
+        packed |= (static_cast<uint64_t>(c1) << (r << 2));
+        continue;
+      }
+
       if (c2) {
-        int bestKey = bestRowKey;
+        int bestC = -1, bestD = 99;
         uint32_t cm = c2;
         while (cm) {
           const uint32_t cb = cm & (~cm + 1u);
           cm ^= cb;
-          const int c = ctzBit(cb);
-          const int key = (2 << 4) | centerDist[c];
-          if (key < bestKey) {
-            bestKey = key;
-            bestCol = c;
-          }
+          const int c = ctzBit32(cb);
+          if (centerDist[c] < bestD) { bestD = centerDist[c]; bestC = c; }
         }
-        if (bestCol >= 0) bestColAvail = availCol(bestCol, rowMask, diagSum, diagDiffCol);
-      } else if (bestRowCnt >= 4) {
-        int bestKey = bestRowKey;
-        uint32_t cm = full ^ colMask;
-        while (cm) {
-          const uint32_t cb = cm & (~cm + 1u);
-          cm ^= cb;
-          const int c = ctzBit(cb);
-          const uint32_t ca = availCol(c, rowMask, diagSum, diagDiffCol);
-          const int key = (popcnt32(ca) << 4) | centerDist[c];
-          if (key < bestKey) {
-            bestKey = key;
-            bestCol = c;
-            bestColAvail = ca;
-          }
+        const uint32_t cb = 1u << bestC;
+        const uint32_t rmask = colRowsMask<TwoWords>(bestC, d0, d1, d2);
+        const uint32_t rb0 = rmask & (~rmask + 1u);
+        const uint32_t rb1 = rmask ^ rb0;
+        const int r0 = ctzBit32(rb0), r1 = ctzBit32(rb1);
+        const uint32_t nColMask = colMask | cb;
+        uint64_t nd0 = d0, nd1 = d1, nd2 = d2;
+        place<TwoWords>(r0, bestC, nd0, nd1, nd2);
+        dfs<Mode, TwoWords>(rem - 1, rowMask | rb0, nColMask, nd0, nd1, nd2,
+                            packed | (static_cast<uint64_t>(bestC) << (r0 << 2)));
+        --rem;
+        rowMask |= rb1;
+        colMask = nColMask;
+        place<TwoWords>(r1, bestC, d0, d1, d2);
+        packed |= (static_cast<uint64_t>(bestC) << (r1 << 2));
+        continue;
+      }
+
+      // 5. All remaining rows & columns have >= 3 options: pick tightest central row.
+      int bestR = -1, bestKey = 1000;
+      uint32_t bestAv = 0;
+      uint32_t fr = full ^ rowMask;
+      while (fr) {
+        const uint32_t rb = fr & (~fr + 1u);
+        fr ^= rb;
+        const int r = ctzBit32(rb);
+        const uint32_t av = getLane<TwoWords>(r, d0, d1, d2);
+        const int key = (popcnt32(av) << 4) | centerDist[r];
+        if (key < bestKey) {
+          bestKey = key;
+          bestR = r;
+          bestAv = av;
         }
       }
 
-      if (bestCol >= 0) {
-        const int c = bestCol;
-        const uint32_t cb = 1u << c;
-        uint32_t avail = bestColAvail;
-        while (avail) {
-          const uint32_t rb = avail & (~avail + 1u);
-          avail ^= rb;
-          const int r = ctzBit(rb);
-          dfs<Mode>(rem - 1, rowMask | rb, colMask | cb,
-                    diagSum | (1u << (r + c)),
-                    diagDiffRow | (1u << (c - r + m)),
-                    diagDiffCol | (1u << (r - c + m)),
-                    packed | (static_cast<uint64_t>(c) << (r << 2)));
+      const uint32_t nRowMask = rowMask | (1u << bestR);
+      uint32_t av = bestAv;
+      while (av) {
+        const uint32_t cb = av & (~av + 1u);
+        av ^= cb;
+        const int c = ctzBit32(cb);
+        if (!av) {
+          --rem;
+          rowMask = nRowMask;
+          colMask |= cb;
+          place<TwoWords>(bestR, c, d0, d1, d2);
+          packed |= (static_cast<uint64_t>(c) << (bestR << 2));
+          break;
         }
-        return;
+        uint64_t nd0 = d0, nd1 = d1, nd2 = d2;
+        place<TwoWords>(bestR, c, nd0, nd1, nd2);
+        dfs<Mode, TwoWords>(rem - 1, nRowMask, colMask | cb, nd0, nd1, nd2,
+                            packed | (static_cast<uint64_t>(c) << (bestR << 2)));
       }
-
-      const int r = bestRow;
-      const uint32_t rb = 1u << r;
-      uint32_t avail = bestRowAvail;
-      while (avail) {
-        const uint32_t cb = avail & (~avail + 1u);
-        avail ^= cb;
-        const int c = ctzBit(cb);
-        dfs<Mode>(rem - 1, rowMask | rb, colMask | cb,
-                  diagSum | (1u << (r + c)),
-                  diagDiffRow | (1u << (c - r + m)),
-                  diagDiffCol | (1u << (r - c + m)),
-                  packed | (static_cast<uint64_t>(c) << (r << 2)));
-      }
-      return;
     }
   }
 
-  template <bool HasHoles>
+  inline void packRows(const uint32_t* rowAllowed, uint32_t rowMask,
+                       uint64_t& d0, uint64_t& d1, uint64_t& d2) const {
+    d0 = kSentWord;
+    d1 = kSentWord;
+    d2 = kSentWord;
+    for (int r = 0; r < n; ++r) {
+      if (rowMask & (1u << r)) continue;
+      const int sh = (r & 3) << 4;
+      const uint64_t clearMask = ~(0xFFFFULL << sh);
+      const uint64_t val = static_cast<uint64_t>(rowAllowed[r]) << sh;
+      if (r < 4) d0 = (d0 & clearMask) | val;
+      else if (r < 8) d1 = (d1 & clearMask) | val;
+      else d2 = (d2 & clearMask) | val;
+    }
+  }
+
+  template <bool HasHoles, bool TwoWords>
   void runD4() {
     constexpr int kCornerMode = HasHoles ? kD4CornerHoles : kD4CornerClean;
     constexpr int kIntMode = HasHoles ? kD4IntHoles : kD4IntClean;
+    uint32_t rm[kMaxN];
 
-    // Family 1: Corner queen at (0, 0) and row 1 at (1, c1).
     if (!HasHoles || killMask[0][0] != 0xFFu) {
       for (int c1 = 2; c1 < n; ++c1) {
         if (HasHoles && ((killMask[0][0] | killMask[1][c1]) == 0xFFu)) continue;
         keyCol = c1;
-        for (int i = 0; i < n; ++i) {
-          rowAllowed[i] = full;
-          colAllowed[i] = full;
-        }
-        for (int r = 2; r < c1; ++r) {
-          rowAllowed[r] = full & ~2u;
-          colAllowed[1] &= ~(1u << r);
-        }
-        const uint32_t rm = 3u;
-        const uint32_t cm = 1u | (1u << c1);
-        const uint32_t ds = 1u | (1u << (1 + c1));
-        const uint32_t ddr = (1u << m) | (1u << (c1 - 1 + m));
-        const uint32_t ddc = (1u << m) | (1u << (1 - c1 + m));
-        dfs<kCornerMode>(n - 2, rm, cm, ds, ddr, ddc, static_cast<uint64_t>(c1) << 4);
+        for (int r = 0; r < n; ++r) rm[r] = (r >= 2 && r < c1) ? (full & ~2u) : full;
+        uint64_t d0, d1, d2;
+        packRows(rm, 0u, d0, d1, d2);
+        place<TwoWords>(0, 0, d0, d1, d2);
+        place<TwoWords>(1, c1, d0, d1, d2);
+        dfs<kCornerMode, TwoWords>(n - 2, 3u, 1u | (1u << c1), d0, d1, d2, static_cast<uint64_t>(c1) << 4);
       }
     }
 
-    // Family 2: No corner queen; minimum border distance c0 at (0, c0).
-    const uint32_t edgeBits = 1u | (1u << m);
-    const uint32_t noSides = full & ~edgeBits;
-    const uint32_t noBottom = full & ~(1u << m);
+    const uint32_t noSides = full & ~(1u | (1u << m));
     for (int c0 = 1; c0 <= (n - 2) / 2; ++c0) {
       if (HasHoles && killMask[0][c0] == 0xFFu) continue;
       keyCol = c0;
-      const uint32_t midMask = ((1u << (n - 2 * c0)) - 1u) << c0;
-      rowAllowed[0] = full;
-      for (int r = 1; r < m; ++r) {
-        rowAllowed[r] = (r < c0 || r >= n - c0) ? noSides : full;
-      }
-      rowAllowed[m] = midMask;
-      colAllowed[0] = midMask;
-      colAllowed[m] = midMask;
-      for (int c = 1; c < m; ++c) {
-        colAllowed[c] = (c < c0 || c >= n - c0) ? noBottom : full;
-      }
-      const uint32_t rm = 1u;
-      const uint32_t cm = 1u << c0;
-      const uint32_t ds = 1u << c0;
-      const uint32_t ddr = 1u << (c0 + m);
-      const uint32_t ddc = 1u << (m - c0);
-      dfs<kIntMode>(n - 1, rm, cm, ds, ddr, ddc, static_cast<uint64_t>(c0));
+      rm[0] = full;
+      for (int r = 1; r < m; ++r) rm[r] = (r < c0 || r >= n - c0) ? noSides : full;
+      rm[m] = ((1u << (n - 2 * c0)) - 1u) << c0;
+      uint64_t d0, d1, d2;
+      packRows(rm, 0u, d0, d1, d2);
+      place<TwoWords>(0, c0, d0, d1, d2);
+      dfs<kIntMode, TwoWords>(n - 1, 1u, 1u << c0, d0, d1, d2, static_cast<uint64_t>(c0));
     }
   }
 };
@@ -503,11 +924,8 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
     if (static_cast<int>(line.size()) != n) return {};
   }
 
-  UnifiedHolesAlgX solver;
-  solver.n = n;
-  solver.m = n - 1;
-  solver.full = (1u << n) - 1u;
-
+  uint32_t rowAllowed[kMaxN]{};
+  uint32_t colAllowed[kMaxN]{};
   int holeCount = 0;
   int minLineFree = n;
   for (int r = 0; r < n; ++r) {
@@ -518,19 +936,17 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
         ++holeCount;
       } else {
         mask |= (1u << c);
-        solver.colAllowed[c] |= (1u << r);
+        colAllowed[c] |= (1u << r);
       }
     }
     if (mask == 0) return {};
-    solver.rowAllowed[r] = mask;
+    rowAllowed[r] = mask;
     const int cnt = popcnt32(mask);
     if (cnt < minLineFree) minLineFree = cnt;
-    const int d = 2 * r - solver.m;
-    solver.centerDist[r] = static_cast<uint8_t>(d < 0 ? -d : d);
   }
   for (int c = 0; c < n; ++c) {
-    if (solver.colAllowed[c] == 0) return {};
-    const int cnt = popcnt32(solver.colAllowed[c]);
+    if (colAllowed[c] == 0) return {};
+    const int cnt = popcnt32(colAllowed[c]);
     if (cnt < minLineFree) minLineFree = cnt;
   }
 
@@ -541,12 +957,63 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
   }
   if (n < 4) return {};
 
-  const bool useD4 = (n <= 12) && (holeCount == 0 || (minLineFree >= 3 && holeCount * 8 <= n * n));
+  const uint32_t full = (1u << n) - 1u;
+  const bool useD4 = (holeCount == 0 || (minLineFree >= 3 && holeCount * 8 <= n * n));
+
+  int rem = n;
+  uint32_t rowMask = 0;
+  uint32_t colMask = 0;
+  uint64_t packed = 0;
+  if (!useD4) {
+    // General Holes path: root unit propagation before building attack tables.
+    if (minLineFree == 1) {
+      if (!rootUnitProp(n, full, rowAllowed, rem, rowMask, colMask, packed)) return {};
+      if (rem == 0) {
+        std::vector<std::vector<int>> solutions;
+        solutions.reserve(1);
+        emitPacked(packed, n, snapshotsEnabled(), solutions);
+        return solutions;
+      }
+      if (rem == 2) {
+        const uint32_t fr = full ^ rowMask;
+        const uint32_t rb0 = fr & (~fr + 1u);
+        const int r0 = ctzBit32(rb0), r1 = ctzBit32(fr ^ rb0);
+        const uint32_t fc = full ^ colMask;
+        const uint32_t cb0 = fc & (~fc + 1u);
+        const int c0 = ctzBit32(cb0), c1 = ctzBit32(fc ^ cb0);
+        if (r1 - r0 == c1 - c0) return {};
+        std::vector<std::vector<int>> solutions;
+        solutions.reserve(2);
+        const bool debug = snapshotsEnabled();
+        emitPacked(packed | (static_cast<uint64_t>(c0) << (r0 << 2)) |
+                   (static_cast<uint64_t>(c1) << (r1 << 2)), n, debug, solutions);
+        emitPacked(packed | (static_cast<uint64_t>(c1) << (r0 << 2)) |
+                   (static_cast<uint64_t>(c0) << (r1 << 2)), n, debug, solutions);
+        return solutions;
+      }
+    }
+
+    // Reduced-board Hall check (skipped when Dirac guarantees a perfect matching).
+    const uint32_t freeRows = full ^ rowMask;
+    if (minLineFree == 1 || minLineFree < (rem + 1) / 2) {
+      if (!hasPerfectMatchingRem(n, freeRows, rowAllowed)) return {};
+    }
+  }
+
+  // Single SwarHolesAlgX instance (~33 KB) keeps Emscripten 64 KB stack safe.
+  SwarHolesAlgX solver;
+  solver.n = n;
+  solver.m = n - 1;
+  solver.full = full;
+
   if (useD4) {
+    // Hall's condition is mathematically guaranteed for minLineFree >= 3 && H <= N^2/8 (N <= 12).
+    solver.buildTables(nullptr);
+
     if (holeCount == 0) {
-      solver.runD4<false>();
+      if (n <= 8) solver.runD4<false, true>();
+      else solver.runD4<false, false>();
     } else {
-      if (minLineFree < (n + 1) / 2 && !hasPerfectMatching(n, solver.rowAllowed)) return {};
       const int m = n - 1;
       for (int hr = 0; hr < n; ++hr) {
         const std::string& row = grid[hr];
@@ -562,7 +1029,8 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
           solver.killMask[m - hc][m - hr] |= 1u << 7;
         }
       }
-      solver.runD4<true>();
+      if (n <= 8) solver.runD4<true, true>();
+      else solver.runD4<true, false>();
     }
 
     std::vector<std::vector<int>> solutions;
@@ -575,19 +1043,37 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
     return solutions;
   }
 
-  if (minLineFree < (n + 1) / 2 && !hasPerfectMatching(n, solver.rowAllowed)) return {};
+  solver.buildTables(rowAllowed);
 
-  solver.dfs<kGeneralBuf>(n, 0, 0, 0, 0, 0, 0);
+  uint64_t d0, d1, d2;
+  solver.packRows(rowAllowed, rowMask, d0, d1, d2);
+
+  // Root SWAR SAC-1 pruning for medium/dense/UNSAT boards (H >= N^2/3).
+  if (rem >= 3 && holeCount * 3 >= n * n) {
+    const bool ok = (n <= 8)
+                        ? solver.sacPrune<true>(rem, rowMask, colMask, d0, d1, d2, packed)
+                        : solver.sacPrune<false>(rem, rowMask, colMask, d0, d1, d2, packed);
+    if (!ok) return {};
+    if (rem == 0) {
+      std::vector<std::vector<int>> solutions;
+      solutions.reserve(1);
+      emitPacked(packed, n, snapshotsEnabled(), solutions);
+      return solutions;
+    }
+  }
+
+  if (n <= 8) solver.dfs<kGeneralBuf, true>(rem, rowMask, colMask, d0, d1, d2, packed);
+  else solver.dfs<kGeneralBuf, false>(rem, rowMask, colMask, d0, d1, d2, packed);
 
   std::vector<std::vector<int>> solutions;
   solutions.reserve(solver.totalSolutions);
   const bool debug = snapshotsEnabled();
-  if (solver.totalSolutions <= UnifiedHolesAlgX::kStackCap) {
+  if (solver.totalSolutions <= SwarHolesAlgX::kStackCap) {
     if (!debug) {
       int buf[kMaxN];
       for (size_t i = 0; i < solver.totalSolutions; ++i) {
-        const uint64_t packed = solver.stackBuf[i];
-        for (int r = 0; r < n; ++r) buf[r] = static_cast<int>((packed >> (r << 2)) & 0xFu);
+        const uint64_t sol = solver.stackBuf[i];
+        for (int r = 0; r < n; ++r) buf[r] = static_cast<int>((sol >> (r << 2)) & 0xFu);
         solutions.emplace_back(buf, buf + n);
       }
     } else {
@@ -598,7 +1084,8 @@ std::vector<std::vector<int>> solveHoles(int n, const std::vector<std::string>& 
   } else {
     solver.out = &solutions;
     solver.debug = debug;
-    solver.dfs<kGeneralEmit>(n, 0, 0, 0, 0, 0, 0);
+    if (n <= 8) solver.dfs<kGeneralEmit, true>(rem, rowMask, colMask, d0, d1, d2, packed);
+    else solver.dfs<kGeneralEmit, false>(rem, rowMask, colMask, d0, d1, d2, packed);
   }
   return solutions;
 }

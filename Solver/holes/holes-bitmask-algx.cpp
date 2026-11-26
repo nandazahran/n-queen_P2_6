@@ -381,14 +381,14 @@ bool hasPerfectMatching(int n, const uint32_t* rowAllowed) {
   return true;
 }
 
-// 64KB-safe Bidirectional Bitmask Algorithm X for moderate/dense Holes (and N > 12 fallback).
+// 64KB-safe Turbo Bidirectional Bitmask Algorithm X for moderate/dense Holes (and N > 12 fallback).
 struct HolesSearch {
   int n = 0;
   int m = 0;
   uint32_t full = 0;
   uint32_t rowAllowed[kMaxN]{};
   uint32_t colAllowed[kMaxN]{};
-  int remRows[kMaxN]{};
+  uint8_t centerDist[kMaxN]{};
 
   static constexpr size_t kStackCap = 3072;  // 24 KB on stack
   uint64_t stackSols[kStackCap];
@@ -417,139 +417,172 @@ struct HolesSearch {
   template <bool DirectEmit>
   void dfs(int rem, uint32_t rowMask, uint32_t colMask, uint32_t diagSum,
            uint32_t diagDiffRow, uint32_t diagDiffCol, uint64_t packed) {
-    if (rem == 1) {
-      const int r0 = remRows[0];
-      const uint32_t a0 = availRow(r0, colMask, diagSum, diagDiffRow);
-      if (a0) {
-        recordPacked<DirectEmit>(packed | (static_cast<uint64_t>(ctzBit(a0)) << (r0 << 2)));
+    for (;;) {
+      if (rem == 1) {
+        const int r0 = ctzBit(full ^ rowMask);
+        const uint32_t a0 = availRow(r0, colMask, diagSum, diagDiffRow);
+        if (a0) {
+          recordPacked<DirectEmit>(packed | (static_cast<uint64_t>(ctzBit(a0)) << (r0 << 2)));
+        }
+        return;
       }
-      return;
-    }
-    if (rem == 2) {
-      const int r0 = remRows[0], r1 = remRows[1];
-      uint32_t a0 = availRow(r0, colMask, diagSum, diagDiffRow);
-      if (!a0) return;
-      const uint32_t a1Base = availRow(r1, colMask, diagSum, diagDiffRow);
-      if (!a1Base) return;
-      while (a0) {
-        const uint32_t b0 = a0 & (~a0 + 1u);
-        a0 ^= b0;
-        const int c0 = ctzBit(b0);
-        const uint32_t ds = diagSum | (1u << (r0 + c0));
-        const uint32_t ddr = diagDiffRow | (1u << (c0 - r0 + m));
-        const uint32_t a1 = a1Base & ~(b0 | (ds >> r1) | (ddr >> (m - r1)));
-        if (a1) {
+      if (rem == 2) {
+        const uint32_t fr = full ^ rowMask;
+        const uint32_t rb0 = fr & (~fr + 1u);
+        const int r0 = ctzBit(rb0);
+        const int r1 = ctzBit(fr ^ rb0);
+        const uint32_t fc = full ^ colMask;
+        const uint32_t cb0 = fc & (~fc + 1u);
+        const uint32_t cb1 = fc ^ cb0;
+        const int c0 = ctzBit(cb0);
+        const int c1 = ctzBit(cb1);
+        // Geometric prune: when r0 < r1 and c0 < c1, both pairings share a diagonal iff r1 - r0 == c1 - c0.
+        if (r1 - r0 == c1 - c0) return;
+        const uint32_t a0 = availRow(r0, colMask, diagSum, diagDiffRow);
+        if (!a0) return;
+        const uint32_t a1 = availRow(r1, colMask, diagSum, diagDiffRow);
+        if (!a1) return;
+        if ((a0 & cb0) && (a1 & cb1)) {
           recordPacked<DirectEmit>(packed | (static_cast<uint64_t>(c0) << (r0 << 2)) |
-                                   (static_cast<uint64_t>(ctzBit(a1)) << (r1 << 2)));
+                                   (static_cast<uint64_t>(c1) << (r1 << 2)));
+        }
+        if ((a0 & cb1) && (a1 & cb0)) {
+          recordPacked<DirectEmit>(packed | (static_cast<uint64_t>(c1) << (r0 << 2)) |
+                                   (static_cast<uint64_t>(c0) << (r1 << 2)));
+        }
+        return;
+      }
+
+      uint32_t fr = full ^ rowMask;
+      uint32_t once = 0, twice = 0, thrice = 0;
+      int bestRow = -1;
+      int bestRowKey = 1000;
+      uint32_t bestRowAvail = 0;
+      bool forced = false;
+      int fR = 0, fC = 0;
+      uint32_t fRB = 0, fCB = 0;
+
+      while (fr) {
+        const uint32_t rb = fr & (~fr + 1u);
+        fr ^= rb;
+        const int r = ctzBit(rb);
+        const uint32_t a = availRow(r, colMask, diagSum, diagDiffRow);
+        if (!a) return;
+        if ((a & (a - 1u)) == 0u) {
+          forced = true;
+          fR = r;
+          fRB = rb;
+          fCB = a;
+          fC = ctzBit(a);
+          break;
+        }
+        const int key = (popcnt32(a) << 4) | centerDist[r];
+        if (key < bestRowKey) {
+          bestRowKey = key;
+          bestRow = r;
+          bestRowAvail = a;
+        }
+        thrice |= (twice & a);
+        twice |= (once & a);
+        once |= a;
+      }
+
+      if (forced) {
+        --rem;
+        rowMask |= fRB;
+        colMask |= fCB;
+        diagSum |= (1u << (fR + fC));
+        diagDiffRow |= (1u << (fC - fR + m));
+        diagDiffCol |= (1u << (fR - fC + m));
+        packed |= (static_cast<uint64_t>(fC) << (fR << 2));
+        continue;
+      }
+
+      if ((once | colMask) != full) return;
+
+      const uint32_t uniqueCols = once & ~twice;
+      if (uniqueCols) {
+        const uint32_t cb = uniqueCols & (~uniqueCols + 1u);
+        const int c = ctzBit(cb);
+        const uint32_t rb = availCol(c, rowMask, diagSum, diagDiffCol);
+        const int r = ctzBit(rb);
+        --rem;
+        rowMask |= rb;
+        colMask |= cb;
+        diagSum |= (1u << (r + c));
+        diagDiffRow |= (1u << (c - r + m));
+        diagDiffCol |= (1u << (r - c + m));
+        packed |= (static_cast<uint64_t>(c) << (r << 2));
+        continue;
+      }
+
+      const int bestRowCnt = bestRowKey >> 4;
+      int bestCol = -1;
+      uint32_t bestColAvail = 0;
+      const uint32_t c2 = twice & ~thrice;
+      if (c2) {
+        int bestKey = bestRowKey;
+        uint32_t cm = c2;
+        while (cm) {
+          const uint32_t cb = cm & (~cm + 1u);
+          cm ^= cb;
+          const int c = ctzBit(cb);
+          const int key = (2 << 4) | centerDist[c];
+          if (key < bestKey) {
+            bestKey = key;
+            bestCol = c;
+          }
+        }
+        if (bestCol >= 0) bestColAvail = availCol(bestCol, rowMask, diagSum, diagDiffCol);
+      } else if (bestRowCnt >= 4) {
+        int bestKey = bestRowKey;
+        uint32_t cm = full ^ colMask;
+        while (cm) {
+          const uint32_t cb = cm & (~cm + 1u);
+          cm ^= cb;
+          const int c = ctzBit(cb);
+          const uint32_t ca = availCol(c, rowMask, diagSum, diagDiffCol);
+          const int key = (popcnt32(ca) << 4) | centerDist[c];
+          if (key < bestKey) {
+            bestKey = key;
+            bestCol = c;
+            bestColAvail = ca;
+          }
         }
       }
-      return;
-    }
 
-    uint32_t rowAvail[kMaxN];
-    int bestRowIdx = -1;
-    int bestCount = 32;
-    uint32_t once = 0, twice = 0;
-
-    for (int i = 0; i < rem; ++i) {
-      const int r = remRows[i];
-      const uint32_t a = availRow(r, colMask, diagSum, diagDiffRow);
-      if (!a) return;
-      rowAvail[i] = a;
-      const int cnt = popcnt32(a);
-      if (cnt < bestCount) {
-        bestCount = cnt;
-        bestRowIdx = i;
-        if (cnt == 1) {
-          const int c = ctzBit(a);
-          remRows[i] = remRows[rem - 1];
-          dfs<DirectEmit>(rem - 1, rowMask | (1u << r), colMask | a,
+      if (bestCol >= 0) {
+        const int c = bestCol;
+        const uint32_t cb = 1u << c;
+        uint32_t avail = bestColAvail;
+        while (avail) {
+          const uint32_t rb = avail & (~avail + 1u);
+          avail ^= rb;
+          const int r = ctzBit(rb);
+          dfs<DirectEmit>(rem - 1, rowMask | rb, colMask | cb,
                           diagSum | (1u << (r + c)),
                           diagDiffRow | (1u << (c - r + m)),
                           diagDiffCol | (1u << (r - c + m)),
                           packed | (static_cast<uint64_t>(c) << (r << 2)));
-          remRows[i] = r;
-          return;
         }
+        return;
       }
-      twice |= (once & a);
-      once |= a;
-    }
 
-    if ((once | colMask) != full) return;
-
-    const uint32_t uniqueCols = once & ~twice;
-    if (uniqueCols) {
-      const uint32_t colBit = uniqueCols & (~uniqueCols + 1u);
-      const int c = ctzBit(colBit);
-      int idx = 0;
-      while (!(rowAvail[idx] & colBit)) ++idx;
-      const int r = remRows[idx];
-      remRows[idx] = remRows[rem - 1];
-      dfs<DirectEmit>(rem - 1, rowMask | (1u << r), colMask | colBit,
-                      diagSum | (1u << (r + c)),
-                      diagDiffRow | (1u << (c - r + m)),
-                      diagDiffCol | (1u << (r - c + m)),
-                      packed | (static_cast<uint64_t>(c) << (r << 2)));
-      remRows[idx] = r;
-      return;
-    }
-
-    int bestCol = -1;
-    uint32_t bestColAvail = 0;
-    if (bestCount >= 3) {
-      uint32_t freeCols = full & ~colMask;
-      while (freeCols) {
-        const uint32_t cb = freeCols & (~freeCols + 1u);
-        freeCols ^= cb;
-        const int c = ctzBit(cb);
-        const uint32_t ca = availCol(c, rowMask, diagSum, diagDiffCol);
-        const int cnt = popcnt32(ca);
-        if (cnt < bestCount) {
-          bestCount = cnt;
-          bestCol = c;
-          bestColAvail = ca;
-          if (cnt == 2) break;
-        }
-      }
-    }
-
-    if (bestCol >= 0) {
-      const int c = bestCol;
-      const uint32_t cb = 1u << c;
-      uint32_t avail = bestColAvail;
+      const int r = bestRow;
+      const uint32_t rb = 1u << r;
+      uint32_t avail = bestRowAvail;
       while (avail) {
-        const uint32_t rb = avail & (~avail + 1u);
-        avail ^= rb;
-        const int r = ctzBit(rb);
-        int idx = 0;
-        while (remRows[idx] != r) ++idx;
-        remRows[idx] = remRows[rem - 1];
+        const uint32_t cb = avail & (~avail + 1u);
+        avail ^= cb;
+        const int c = ctzBit(cb);
         dfs<DirectEmit>(rem - 1, rowMask | rb, colMask | cb,
                         diagSum | (1u << (r + c)),
                         diagDiffRow | (1u << (c - r + m)),
                         diagDiffCol | (1u << (r - c + m)),
                         packed | (static_cast<uint64_t>(c) << (r << 2)));
-        remRows[idx] = r;
       }
       return;
     }
-
-    const int r = remRows[bestRowIdx];
-    const uint32_t rb = 1u << r;
-    uint32_t avail = rowAvail[bestRowIdx];
-    remRows[bestRowIdx] = remRows[rem - 1];
-    while (avail) {
-      const uint32_t b = avail & (~avail + 1u);
-      avail ^= b;
-      const int c = ctzBit(b);
-      dfs<DirectEmit>(rem - 1, rowMask | rb, colMask | b,
-                      diagSum | (1u << (r + c)),
-                      diagDiffRow | (1u << (c - r + m)),
-                      diagDiffCol | (1u << (r - c + m)),
-                      packed | (static_cast<uint64_t>(c) << (r << 2)));
-    }
-    remRows[bestRowIdx] = r;
   }
 };
 
@@ -562,7 +595,8 @@ std::vector<std::vector<int>> solveHolesAlgX(int n, const uint32_t* rowAllowed,
   for (int i = 0; i < n; ++i) {
     search.rowAllowed[i] = rowAllowed[i];
     search.colAllowed[i] = colAllowed[i];
-    search.remRows[i] = i;
+    const int d = 2 * i - search.m;
+    search.centerDist[i] = static_cast<uint8_t>(d < 0 ? -d : d);
   }
   search.dfs<false>(n, 0, 0, 0, 0, 0, 0);
 
@@ -585,7 +619,6 @@ std::vector<std::vector<int>> solveHolesAlgX(int n, const uint32_t* rowAllowed,
   } else {
     search.out = &solutions;
     search.debug = debug;
-    for (int r = 0; r < n; ++r) search.remRows[r] = r;
     search.dfs<true>(n, 0, 0, 0, 0, 0, 0);
   }
   return solutions;
